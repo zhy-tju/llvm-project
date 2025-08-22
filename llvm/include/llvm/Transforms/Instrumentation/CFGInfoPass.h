@@ -1,44 +1,21 @@
-// CFGInfoPass.h (最终修正版)
-
 #ifndef LLVM_TRANSFORMS_INSTRUMENTATION_CFGINFOPASS_H
 #define LLVM_TRANSFORMS_INSTRUMENTATION_CFGINFOPASS_H
 
 #include "llvm/IR/PassManager.h"
-#include "llvm/ADT/DenseMap.h"
-#include <mutex>
-#include <string>
-#include <vector>
-
-// 使用前向声明，而不是包含完整的头文件，让头文件更轻量
-namespace llvm {
-  class Function;
-  class BasicBlock;
-  
-}
 
 namespace llvm {
-  class CFGInfoPass : public PassInfoMixin<CFGInfoPass> {
-  private:
-    std::string Filename = "cfg_graph.json";
-    DenseMap<BasicBlock*, unsigned> BBIndexMap;
-    unsigned NextIndex = 0;
-    
-    static std::mutex FileMutex;
-    static std::vector<std::string> FunctionJsonBuffer;
 
-    std::vector<std::string> getRawInstructions(BasicBlock &BB);
-    std::string generateFunctionJson(Function &F, FunctionAnalysisManager &AM);
+// Pass现在是一个ModulePass，它会对每个源文件（模块）运行一次
+class CFGInfoPass : public PassInfoMixin<CFGInfoPass> {
+public:
+    // Pass的入口点现在是 run(Module&, ModuleAnalysisManager&)
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 
-  public:
-    bool EnableJsonOutput;
-    bool EnableCFGInfoUserOnly;
-    bool FilterByLoop;
-    
-    CFGInfoPass();
-    ~CFGInfoPass();
+    // 我们可以通过一个静态布尔值来确保Pass只被CMakeLists中的一个地方添加
+    // 这在新的Pass管理器中是必需的
+    static bool isRequired() { return true; }
+};
 
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
-  };
 } // namespace llvm
 
 #endif // LLVM_TRANSFORMS_INSTRUMENTATION_CFGINFOPASS_H

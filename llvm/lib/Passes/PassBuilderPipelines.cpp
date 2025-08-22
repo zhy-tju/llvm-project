@@ -438,7 +438,6 @@ PassBuilder::buildO1FunctionSimplificationPipeline(OptimizationLevel Level,
 
   // Form SSA out of local memory accesses after breaking apart aggregates into
   // scalars.
-  FPM.addPass(CFGInfoPass());
   FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
 
   // Catch trivial redundancies
@@ -585,7 +584,6 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
 
   // Form SSA out of local memory accesses after breaking apart aggregates into
   // scalars.
-  FPM.addPass(CFGInfoPass());
   FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
 
   // Catch trivial redundancies
@@ -1133,6 +1131,8 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
       EarlyFPM.addPass(CallSiteSplittingPass());
     MPM.addPass(createModuleToFunctionPassAdaptor(
         std::move(EarlyFPM), PTO.EagerlyInvalidateAnalyses));
+    // 在EarlyFPM之后插入CFGInfoPass，确保收集CFG和PGO profile数据
+    MPM.addPass(CFGInfoPass());
   }
 
   if (LoadSampleProfile) {

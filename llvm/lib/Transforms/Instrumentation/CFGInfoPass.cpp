@@ -1,46 +1,48 @@
 #include "llvm/Transforms/Instrumentation/CFGInfoPass.h"
-#include "llvm/Analysis/DominanceFrontier.h"
+
+// 包含所有必要的头文件
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/InstrTypes.h" // This header defines TerminatorInst
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cctype>
 #include <iomanip>
 #include <memory>
 #include <set>
 #include <sstream>
+#include <algorithm> // for std::replace
 
 using namespace llvm;
 
 // --- Command-Line Options ---
 namespace {
+
+// 主开关：只有当这个标志为true时，Pass才会执行任何操作
 static cl::opt<bool> EnableCFGInfoJsonOutput(
     "enable-cfginfo-json", cl::init(false), cl::Hidden,
     cl::desc("Enable output of CFG info as JSON"));
+
+// 过滤选项
+static cl::opt<bool> CfgFilterByLoop(
+    "cfg-filter-by-loop", cl::init(false), cl::Hidden,
+    cl::desc("Filter functions based on the presence of loops instead of branches."));
 
 static cl::opt<bool> EnableCFGInfoUserOnly(
     "enable-cfginfo-useronly", cl::init(false), cl::Hidden,
     cl::desc("Only output CFG for user-defined functions"));
 
-// 【核心新增】定义新的命令行选项
-static cl::opt<bool> CfgFilterByLoop(
-    "cfg-filter-by-loop", cl::init(false), cl::Hidden,
-    cl::desc("Filter functions based on the presence of loops instead of branches."));
-} // namespace
+} // end anonymous namespace
 
-// --- Static Member Initialization ---
-std::mutex CFGInfoPass::FileMutex;
-std::vector<std::string> CFGInfoPass::FunctionJsonBuffer;
 
-// --- Helper Function Definitions ---
+// --- 辅助函数 (现在是文件内的静态函数，不再是全局) ---
+namespace {
 
 std::string escapeForJson(const std::string &input) {
     std::ostringstream escaped;
@@ -67,11 +69,12 @@ std::string escapeForJson(const std::string &input) {
 
 std::vector<uint64_t> getBranchProfileCounts(Instruction &I) {
     std::vector<uint64_t> weights;
-    MDNode *MD = I.getMetadata(LLVMContext::MD_prof);
-    if (MD && MD->getNumOperands() > 1) {
-        for (unsigned i = 1; i < MD->getNumOperands(); ++i) {
-            if (auto *CI = mdconst::dyn_extract<ConstantInt>(MD->getOperand(i))) {
-                weights.push_back(CI->getZExtValue());
+    if (MDNode *MD = I.getMetadata(LLVMContext::MD_prof)) {
+        if (MD->getNumOperands() > 1) {
+            for (unsigned i = 1; i < MD->getNumOperands(); ++i) {
+                if (auto *CI = mdconst::dyn_extract<ConstantInt>(MD->getOperand(i))) {
+                    weights.push_back(CI->getZExtValue());
+                }
             }
         }
     }
@@ -81,13 +84,22 @@ std::vector<uint64_t> getBranchProfileCounts(Instruction &I) {
 std::string getSafeInstructionString(Instruction &I) {
     std::string InstStr;
     raw_string_ostream RSO(InstStr);
-    I.print(RSO, /*IsForDebug=*/false);
-
+    I.print(RSO, false);
     StringRef Str = RSO.str();
     size_t Start = Str.find_first_not_of(" \t\n\r");
     if (Start == StringRef::npos) return "";
     size_t End = Str.find_last_not_of(" \t\n\r");
     return escapeForJson(Str.substr(Start, End - Start + 1).str());
+}
+
+std::vector<std::string> getRawInstructions(BasicBlock &BB) {
+    std::vector<std::string> Instructions;
+    Instructions.reserve(BB.size());
+    for (Instruction &I : BB) {
+        if (I.isDebugOrPseudoInst()) continue;
+        Instructions.push_back(getSafeInstructionString(I));
+    }
+    return Instructions;
 }
 
 std::vector<std::string> getCalledFunctionNames(BasicBlock &BB) {
@@ -107,109 +119,12 @@ std::vector<std::string> getCalledFunctionNames(BasicBlock &BB) {
     return calledFunctions;
 }
 
-std::vector<std::string> CFGInfoPass::getRawInstructions(BasicBlock &BB) {
-    std::vector<std::string> Instructions;
-    Instructions.reserve(BB.size());
-    for (Instruction &I : BB) {
-        if (I.isDebugOrPseudoInst()) continue;
-        Instructions.push_back(getSafeInstructionString(I));
-    }
-    return Instructions;
-}
-
-
-// --- Pass Implementation ---
-
-CFGInfoPass::CFGInfoPass() {
-    EnableJsonOutput = EnableCFGInfoJsonOutput;
-    EnableCFGInfoUserOnly = EnableCFGInfoUserOnly;
-    // 【核心新增】在构造函数中读取命令行参数的值
-    FilterByLoop = CfgFilterByLoop;
-}
-
-CFGInfoPass::~CFGInfoPass() {
-    if (!EnableJsonOutput || FunctionJsonBuffer.empty()) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(FileMutex);
-    std::error_code EC;
-    raw_fd_ostream OutFile(Filename, EC, sys::fs::OF_Text);
-    if (EC) {
-        errs() << "Error opening output file for final write: " << EC.message() << "\n";
-        return;
-    }
-
-    OutFile << "[\n";
-    for (size_t i = 0; i < FunctionJsonBuffer.size(); ++i) {
-        OutFile << FunctionJsonBuffer[i];
-        if (i < FunctionJsonBuffer.size() - 1) {
-            OutFile << ",\n";
-        }
-    }
-    OutFile << "\n]\n";
-    OutFile.flush();
-}
-
-// Pass主入口点，包含了新的过滤逻辑
-PreservedAnalyses CFGInfoPass::run(Function &F, FunctionAnalysisManager &AM) {
-    if (!EnableJsonOutput) {
-        return PreservedAnalyses::all();
-    }
+std::string generateFunctionJson(Function &F, FunctionAnalysisManager &FAM) {
+    auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     
-    // 跳过没有函数体的函数声明
-    if (F.isDeclaration() || F.empty()) {
-        return PreservedAnalyses::all();
-    }
-    
-    // 【核心修改】根据命令行选项，执行不同的过滤逻辑
-    bool shouldProcess = false;
-    if (FilterByLoop) {
-        // --- 逻辑二：按循环过滤 ---
-        auto &LI = AM.getResult<LoopAnalysis>(F);
-        if (!LI.empty()) {
-            shouldProcess = true;
-        }
-    } else {
-        // --- 逻辑一（默认）：按分支过滤 ---
-        for (BasicBlock &BB : F) {
-            auto *TI = BB.getTerminator();
-            // 只要找到一个分支或Switch指令，就满足条件
-            if (TI && (isa<BranchInst>(TI) || isa<SwitchInst>(TI))) {
-                shouldProcess = true;
-                break; // 找到一个即可，无需继续遍历
-            }
-        }
-    }
-    
-    // 如果函数不满足所选的过滤条件，则直接返回
-    if (!shouldProcess) {
-        return PreservedAnalyses::all();
-    }
-
-    // (可选的) 用户函数过滤逻辑
-    if (EnableCFGInfoUserOnly) {
-        std::string demangledName = demangle(F.getName());
-        if (demangledName != F.getName() && StringRef(demangledName).starts_with("std::")) {
-            return PreservedAnalyses::all();
-        }
-    }
-
-    // 满足条件，生成JSON并存入缓冲区
-    std::string functionJson = generateFunctionJson(F, AM);
-    std::lock_guard<std::mutex> lock(FileMutex);
-    FunctionJsonBuffer.push_back(std::move(functionJson));
-
-    return PreservedAnalyses::all();
-}
-
-// 为单个函数生成JSON字符串 (此函数逻辑不变)
-std::string CFGInfoPass::generateFunctionJson(Function &F, FunctionAnalysisManager &AM) {
-    auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
-    
-    BBIndexMap.clear();
-    NextIndex = 0;
-    for (BasicBlock &BB : F) {
+    DenseMap<const BasicBlock*, unsigned> BBIndexMap;
+    unsigned NextIndex = 0;
+    for (const BasicBlock &BB : F) {
         BBIndexMap[&BB] = NextIndex++;
     }
 
@@ -218,7 +133,7 @@ std::string CFGInfoPass::generateFunctionJson(Function &F, FunctionAnalysisManag
     OS << "    \"name\": \"" << escapeForJson(F.getName().str()) << "\",\n";
 
     std::string demangledName = demangle(F.getName());
-    if (demangledName != F.getName()) {
+    if (demangledName != F.getName().str()) {
         OS << "    \"demangled_name\": \"" << escapeForJson(demangledName) << "\",\n";
     } else {
         OS << "    \"demangled_name\": null,\n";
@@ -227,7 +142,10 @@ std::string CFGInfoPass::generateFunctionJson(Function &F, FunctionAnalysisManag
     OS << "    \"nodes\": [\n";
     
     bool FirstNode = true;
-    for (BasicBlock &BB : F) {
+    for (BasicBlock &BB_ref : F) {
+        // We need a non-const reference for some operations
+        BasicBlock& BB = const_cast<BasicBlock&>(BB_ref);
+
         OS << (FirstNode ? "" : ",\n") << "      {\n";
         OS << "        \"index\": " << BBIndexMap[&BB] << ",\n";
         
@@ -315,4 +233,102 @@ std::string CFGInfoPass::generateFunctionJson(Function &F, FunctionAnalysisManag
     OS << "\n    ]\n";
     OS << "  }";
     return OS.str();
+}
+
+} // end anonymous namespace
+
+// --- Pass Implementation ---
+
+PreservedAnalyses CFGInfoPass::run(Module &M, ModuleAnalysisManager &AM) {
+    // 【核心】首先检查主开关。如果未启用，则不执行任何操作。
+    if (!EnableCFGInfoJsonOutput) {
+        return PreservedAnalyses::all();
+    }
+
+    // 获取FunctionAnalysisManager，以便后续为每个函数获取分析结果
+    auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+    
+    std::vector<std::string> functionJsonStrings;
+
+    // 遍历模块中的每一个函数
+    for (Function &F : M) {
+        if (F.isDeclaration() || F.empty()) {
+            continue;
+        }
+
+        // --- 过滤逻辑 ---
+        bool shouldProcess = false;
+        if (CfgFilterByLoop) {
+            auto &LI = FAM.getResult<LoopAnalysis>(F);
+            if (!LI.empty()) {
+                shouldProcess = true;
+            }
+        } else { // 默认按分支过滤
+            for (BasicBlock &BB : F) {
+                auto *TI = BB.getTerminator();
+                if (TI && (isa<BranchInst>(TI) || isa<SwitchInst>(TI))) {
+                    shouldProcess = true;
+                    break;
+                }
+            }
+        }
+        
+        if (!shouldProcess) continue;
+
+        if (EnableCFGInfoUserOnly) {
+            std::string demangledName = demangle(F.getName());
+            if (demangledName != F.getName().str() && StringRef(demangledName).starts_with("std::")) {
+                continue;
+            }
+        }
+        
+        // 生成该函数的JSON
+        functionJsonStrings.push_back(generateFunctionJson(F, FAM));
+    }
+
+    // --- 在处理完一个模块的所有函数后，立即写入文件 ---
+    if (!functionJsonStrings.empty()) {
+        std::string fullPath = M.getSourceFileName();
+        if (fullPath.empty()) {
+            fullPath = M.getModuleIdentifier();
+        }
+        
+        // --- 【核心修正】使用完整的相对路径来创建唯一的文件名 ---
+        std::string safeFilename = fullPath;
+        
+        // 替换所有可能导致问题的字符
+        std::replace(safeFilename.begin(), safeFilename.end(), '/', '_');
+        std::replace(safeFilename.begin(), safeFilename.end(), '\\', '_');
+        std::replace(safeFilename.begin(), safeFilename.end(), '.', '_');
+        
+        // 移除可能的前导 `..` 产生的下划线
+        while (safeFilename.size() >= 2 && safeFilename.substr(0, 2) == "__") {
+            safeFilename = safeFilename.substr(1);
+        }
+        
+        std::string OutputFilename = "cfg" + safeFilename + ".json";
+        
+        std::error_code EC;
+        // 默认输出到当前工作目录
+        raw_fd_ostream OutFile(OutputFilename, EC, sys::fs::OF_Text);
+        
+        if (EC) {
+            errs() << "Error opening output file " << OutputFilename << ": " << EC.message() << "\n";
+        } else {
+            OutFile << "[\n";
+            for (size_t i = 0; i < functionJsonStrings.size(); ++i) {
+                OutFile << functionJsonStrings[i];
+                if (i < functionJsonStrings.size() - 1) {
+                    OutFile << ",\n";
+                }
+            }
+            OutFile << "\n]\n";
+            OutFile.flush();
+            // (可选) 打印日志，确认文件已生成
+            errs() << "CFG Info for module " << M.getSourceFileName() << " written to " << OutputFilename << "\n";
+        }
+    }
+    
+    // Pass没有修改IR，所以返回all preserved
+    return PreservedAnalyses::all();
 }
