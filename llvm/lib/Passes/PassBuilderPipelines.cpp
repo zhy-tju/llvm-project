@@ -1131,8 +1131,6 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
       EarlyFPM.addPass(CallSiteSplittingPass());
     MPM.addPass(createModuleToFunctionPassAdaptor(
         std::move(EarlyFPM), PTO.EagerlyInvalidateAnalyses));
-    // 在EarlyFPM之后插入CFGInfoPass，确保收集CFG和PGO profile数据
-    MPM.addPass(CFGInfoPass());
   }
 
   if (LoadSampleProfile) {
@@ -1285,7 +1283,9 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
     MPM.addPass(buildModuleInlinerPipeline(Level, Phase));
   else
     MPM.addPass(buildInlinerPipeline(Level, Phase));
-
+  
+  // 在inlineer之后插入CFGInfoPass，确保收集CFG和PGO profile数据
+  MPM.addPass(CFGInfoPass());
   // Remove any dead arguments exposed by cleanups, constant folding globals,
   // and argument promotion.
   MPM.addPass(DeadArgumentEliminationPass());
