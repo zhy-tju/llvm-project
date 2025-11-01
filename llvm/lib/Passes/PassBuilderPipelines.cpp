@@ -83,6 +83,8 @@
 #include "llvm/Transforms/Instrumentation/PGOForceFunctionAttrs.h"
 #include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
 #include "llvm/Transforms/Instrumentation/CFGInfoPass.h"
+#include "llvm/Transforms/Instrumentation/ManualFeaturesCFGPass.h"
+#include "llvm/Transforms/Instrumentation/MLBranchPredictionPass.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/AlignmentFromAssumptions.h"
 #include "llvm/Transforms/Scalar/AnnotationRemarks.h"
@@ -1286,10 +1288,12 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   
   // 在inlineer之后插入CFGInfoPass，确保收集CFG和PGO profile数据
   MPM.addPass(CFGInfoPass());
+  MPM.addPass(ManualFeaturesCFGPass());
+  MPM.addPass(MLBranchPredictionPass());
   // Remove any dead arguments exposed by cleanups, constant folding globals,
   // and argument promotion.
   MPM.addPass(DeadArgumentEliminationPass());
-
+  
   if (Phase != ThinOrFullLTOPhase::ThinLTOPreLink)
     MPM.addPass(CoroCleanupPass());
 
